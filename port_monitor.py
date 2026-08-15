@@ -11,6 +11,7 @@
   * 自动刷新 (默认间隔 3 秒, 可开关)
   * 点击表头排序
   * 结束占用进程、打开进程所在目录、导出 CSV
+  * 可视化仪表盘 (连接状态分布 / Top 进程 / Top 端口 / 连接数趋势)
   * 数据来源优先使用 psutil (更快更全), 未安装时自动回退到 netstat + tasklist
 
 用法:
@@ -21,7 +22,6 @@
 
 import csv
 import io
-import math
 import os
 import queue
 import re
@@ -182,13 +182,19 @@ def collect():
 # 图形界面
 # ---------------------------------------------------------------------------
 
-BG      = "#0f172a"   # 窗口背景
-BG2     = "#1e293b"   # 表体背景
-HEAD_BG = "#334155"   # 表头背景
-FG      = "#e2e8f0"   # 前景
-MUTED   = "#94a3b8"
-ACCENT  = "#38bdf8"
-SEL_BG  = "#2563eb"
+# --- 主题色板 (现代化暗色) ---
+BG      = "#0b1220"   # 窗口背景
+BG2     = "#101c33"   # 表体背景 (偶数行)
+BG_ODD  = "#0d182c"   # 表格奇数行
+CARD    = "#131f36"   # 卡片/图表背景
+HEAD_BG = "#1c2a44"   # 表头/面板背景
+BORDER  = "#263652"   # 边框
+FG      = "#e8eef8"   # 前景
+MUTED   = "#8fa3bd"   # 次要文字
+ACCENT  = "#38bdf8"   # 主强调 (天蓝)
+ACCENT2 = "#818cf8"   # 次强调 (靛蓝)
+GREEN   = "#34d399"   # 成功/监听
+SEL_BG  = "#2563eb"   # 选中行
 
 COLUMNS = ("协议", "本地地址", "端口", "外部地址", "状态", "PID", "进程名", "路径")
 SORT_KEY = {
@@ -201,7 +207,7 @@ SORT_KEY = {
     "进程名":   lambda r: r["name"].lower(),
     "路径":     lambda r: r["path"].lower(),
 }
-WIDTHS = (60, 130, 70, 150, 100, 70, 160, 320)
+WIDTHS = (60, 130, 70, 150, 100, 70, 160, 300)
 
 STATE_TAG = {
     "LISTENING":  "listen",
@@ -230,17 +236,32 @@ STATE_COLORS = (
     ("UDP", "#c084fc"),
     ("其他", "#f87171"),
 )
-BAR_COLORS = ("#38bdf8", "#4ade80", "#fbbf24", "#fb923c", "#c084fc",
+BAR_COLORS = ("#38bdf8", "#34d399", "#fbbf24", "#fb923c", "#a78bfa",
               "#60a5fa", "#f87171", "#22d3ee", "#a3e635", "#f472b6")
+
+
+def _blend(c1, c2, t):
+    """在两种 #rrggbb 颜色之间按比例 t (0~1) 插值。"""
+    def ch(c):
+        return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+    a, b = ch(c1), ch(c2)
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 class PortMonitorApp:
     def __init__(self, root):
         self.root = root
         root.title("端口占用监控器 · Port Monitor")
-        root.geometry("1180x660")
-        root.minsize(900, 480)
+        root.geometry("1180x680")
+        root.minsize(960, 560)
         root.configure(bg=BG)
+
+        try:  # 窗口图标 (开发环境直接使用同目录 ico)
+            _ico = os.path.join(APP_DIR, "port_monitor.ico")
+            if os.path.exists(_ico):
+                root.iconbitmap(_ico)
+        except Exception:
+            pass
 
         self.all_rows = []
         self.samples = []      # 趋势采样: [(HH:MM:SS, 连接总数), ...]
@@ -250,8 +271,13 @@ class PortMonitorApp:
         self._busy = False
         self._q = queue.Queue()
         self.source = "?"
+        self._status_kind = "warn"
+        self._hdr_status_id = None
+        self._dash_timer = None
+        self._hdr_timer = None
 
         self._build_style()
+        self._build_header()
         self._build_toolbar()
         self._build_notebook()
         self._build_statusbar()
@@ -280,65 +306,194 @@ class PortMonitorApp:
         style.configure("TLabel", background=BG, foreground=FG,
                         font=("Microsoft YaHei UI", 10))
         style.configure("Muted.TLabel", foreground=MUTED)
+        style.configure("ChartTitle.TLabel", foreground="#c6d5ec",
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("TSeparator", background=BORDER)
+
+        # 普通按钮
         style.configure("TButton", background=HEAD_BG, foreground=FG,
                         bordercolor=HEAD_BG, focusthickness=0,
-                        font=("Microsoft YaHei UI", 9))
+                        font=("Microsoft YaHei UI", 9), padding=(12, 6))
         style.map("TButton",
-                  background=[("active", "#475569"), ("disabled", BG2)],
+                  background=[("active", "#2c3f63"), ("disabled", "#182238")],
                   foreground=[("disabled", MUTED)])
-        style.configure("TCheckbutton", background=BG, foreground=FG,
+        # 主按钮 (刷新)
+        style.configure("Accent.TButton", background=ACCENT, foreground="#0b1220",
+                        bordercolor=ACCENT, focusthickness=0,
+                        font=("Microsoft YaHei UI", 9, "bold"), padding=(14, 6))
+        style.map("Accent.TButton",
+                  background=[("active", "#7dd3fc"), ("disabled", "#1e3a52")],
+                  foreground=[("disabled", "#3b5a78")])
+        # 危险按钮 (结束进程)
+        style.configure("Danger.TButton", background="#dc2626", foreground="#ffffff",
+                        bordercolor="#dc2626", focusthickness=0,
+                        font=("Microsoft YaHei UI", 9, "bold"), padding=(12, 6))
+        style.map("Danger.TButton",
+                  background=[("active", "#ef4444"), ("disabled", "#3c1d22")],
+                  foreground=[("disabled", "#96646b")])
+        # 切换开关 (按钮式复选)
+        style.layout("Toggle.TCheckbutton", [
+            ("Button.button", {"children": [
+                ("Button.focus", {"children": [
+                    ("Button.label", {"side": "left", "expand": True})]})]})])
+        style.configure("Toggle.TCheckbutton", background=HEAD_BG,
+                        foreground="#9fb3cd", bordercolor=BORDER, padding=(10, 5),
                         font=("Microsoft YaHei UI", 9))
-        style.map("TCheckbutton", background=[("active", BG)])
-        style.configure("Treeview",
-                        background=BG2, fieldbackground=BG2,
-                        foreground=FG, borderwidth=0, rowheight=26,
+        style.map("Toggle.TCheckbutton",
+                  background=[("selected", ACCENT), ("active", "#2c3f63")],
+                  foreground=[("selected", "#0b1220"), ("active", FG)])
+        # 搜索框
+        style.configure("Search.TEntry", fieldbackground="#0d1830", foreground=FG,
+                        bordercolor=BORDER, insertcolor=FG, padding=5)
+        # 表格
+        style.configure("Treeview", background=BG2, fieldbackground=BG2,
+                        foreground=FG, borderwidth=0, rowheight=30,
                         font=("Microsoft YaHei UI", 9))
         style.map("Treeview",
                   background=[("selected", SEL_BG)],
                   foreground=[("selected", "#ffffff")])
-        style.configure("Treeview.Heading",
-                        background=HEAD_BG, foreground=FG,
-                        relief="flat", padding=(8, 7),
+        style.configure("Treeview.Heading", background=HEAD_BG, foreground="#c3d2ea",
+                        relief="flat", padding=(10, 8),
                         font=("Microsoft YaHei UI", 9, "bold"))
-        style.map("Treeview.Heading", background=[("active", "#475569")])
-        style.configure("TEntry", fieldbackground=BG2, foreground=FG,
-                        bordercolor=HEAD_BG, insertcolor=FG)
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=HEAD_BG, foreground=FG,
-                        padding=(16, 6), font=("Microsoft YaHei UI", 9))
+        style.map("Treeview.Heading", background=[("active", "#2c3f63")])
+        # 选项卡
+        style.configure("TNotebook", background=BG, borderwidth=0,
+                        tabmargins=(8, 6, 8, 0))
+        style.configure("TNotebook.Tab", background=HEAD_BG, foreground="#9fb3cd",
+                        padding=(18, 8), borderwidth=0,
+                        font=("Microsoft YaHei UI", 9, "bold"))
         style.map("TNotebook.Tab",
-                  background=[("selected", ACCENT)],
-                  foreground=[("selected", "#0f172a")])
+                  background=[("selected", ACCENT), ("active", "#2c3f63")],
+                  foreground=[("selected", "#0b1220")])
+
+    def _build_header(self):
+        """顶部标题栏: 渐变背景 + 图标 + 标题 + 数据来源徽章 + 状态灯。"""
+        self.header = tk.Canvas(self.root, height=64, bg=HEAD_BG,
+                                highlightthickness=0, bd=0)
+        self.header.pack(fill="x")
+        self.header.bind("<Configure>",
+                         lambda e: self._schedule_header_draw())
+
+    def _schedule_header_draw(self):
+        if getattr(self, "_hdr_timer", None):
+            self.root.after_cancel(self._hdr_timer)
+        self._hdr_timer = self.root.after(80, self._draw_header)
+
+    def _draw_header(self):
+        cv = self.header
+        w, h = cv.winfo_width(), cv.winfo_height()
+        cv.delete("hdr")
+        cv.delete("grad")
+        if w < 80 or h < 40:
+            return
+        # 水平渐变
+        n = max(8, min(72, w // 5))
+        for i in range(n):
+            t = i / (n - 1)
+            x0 = int(w * i / n)
+            cv.create_rectangle(x0, 0, int(w * (i + 1) / n) + 1, h,
+                                fill=_blend("#1a2b4a", "#0d1830", t),
+                                outline="", tags="grad")
+        # 左侧强调条
+        cv.create_rectangle(0, 0, 4, h, fill=ACCENT, outline="", tags="hdr")
+        # Logo + 标题
+        self._draw_logo(cv, 31, h / 2, 30)
+        cv.create_text(62, h / 2 - 10, anchor="w", text="端口占用监控器",
+                       fill=FG, font=("Microsoft YaHei UI", 14, "bold"), tags="hdr")
+        cv.create_text(62, h / 2 + 13, anchor="w",
+                       text="Port Monitor · 本机 TCP/UDP 端口实时监控",
+                       fill=MUTED, font=("Microsoft YaHei UI", 9), tags="hdr")
+        # 数据来源徽章
+        src = ("psutil" if self.source == "psutil"
+               else ("netstat" if self.source == "netstat" else "…"))
+        pw = 62
+        px0, py0 = w - pw - 14, h / 2 - 11
+        self._round_rect(cv, px0, py0, px0 + pw, py0 + 22, 11,
+                         fill="#0b1220", outline=BORDER, width=1, tags="hdr")
+        cv.create_text(px0 + pw / 2, py0 + 11, text=src, fill=ACCENT,
+                       font=("Microsoft YaHei UI", 9, "bold"), tags="hdr")
+        # 状态灯 + 状态文字
+        tx = px0 - 34
+        kind = getattr(self, "_status_kind", "ok")
+        dot = {"ok": GREEN, "warn": "#fbbf24", "err": "#f87171"}.get(kind, GREEN)
+        cv.create_oval(tx - 12, h / 2 - 4, tx - 4, h / 2 + 4, fill=dot,
+                       outline="", tags="hdr")
+        self._hdr_status_id = cv.create_text(
+            tx - 18, h / 2, anchor="e",
+            text=self.status_var.get() if hasattr(self, "status_var") else "",
+            fill="#b9c9e2", font=("Microsoft YaHei UI", 9), tags="hdr")
+
+    def _update_header_status(self):
+        if getattr(self, "_hdr_status_id", None) is None:
+            return
+        try:
+            self.header.itemconfigure(
+                self._hdr_status_id,
+                text=self.status_var.get() if hasattr(self, "status_var") else "")
+        except tk.TclError:
+            pass
+
+    def _draw_logo(self, cv, cx, cy, s=30):
+        """圆角方块 + 网络节点图形。"""
+        x0, y0 = cx - s / 2, cy - s / 2
+        self._round_rect(cv, x0, y0, x0 + s, y0 + s, s * 0.26,
+                         fill=ACCENT, outline="", tags="hdr")
+        pts = ((cx - 5.5, cy + 4.5), (cx + 2, cy - 5.5), (cx + 5.5, cy + 5))
+        for (ax, ay), (bx, by) in ((pts[0], pts[1]), (pts[0], pts[2]),
+                                   (pts[1], pts[2])):
+            cv.create_line(ax, ay, bx, by, fill="#0b1220", width=1.6, tags="hdr")
+        for x, y in pts:
+            cv.create_oval(x - 2.6, y - 2.6, x + 2.6, y + 2.6,
+                           fill="#0b1220", outline="", tags="hdr")
+
+    def _round_rect(self, cv, x0, y0, x1, y1, r, **kw):
+        """用平滑多边形绘制圆角矩形。"""
+        r = max(0.0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        pts = [(x0 + r, y0), (x1 - r, y0), (x1, y0 + r), (x1, y1 - r),
+               (x1 - r, y1), (x0 + r, y1), (x0, y1 - r), (x0, y0 + r)]
+        return cv.create_polygon(pts, smooth=True, **kw)
 
     def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=(10, 8, 10, 6))
+        bar = ttk.Frame(self.root, padding=(12, 10, 12, 8))
         bar.pack(fill="x")
 
-        ttk.Label(bar, text="搜索:").pack(side="left")
+        # 搜索组
+        ttk.Label(bar, text="搜索:", style="Muted.TLabel").pack(side="left")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *a: self._render())
-        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=26)
-        self.search_entry.pack(side="left", padx=(4, 6))
+        self.search_entry = ttk.Entry(bar, textvariable=self.search_var, width=24,
+                                      style="Search.TEntry")
+        self.search_entry.pack(side="left", padx=(6, 0))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y",
+                                                   padx=10, pady=2)
 
+        # 过滤组
         self.listen_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="仅监听端口", variable=self.listen_var,
-                        command=self._render).pack(side="left", padx=4)
-
+                        style="Toggle.TCheckbutton",
+                        command=self._render).pack(side="left", padx=(0, 4))
         self.auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="自动刷新", variable=self.auto_var).pack(side="left", padx=4)
+        ttk.Checkbutton(bar, text="自动刷新", variable=self.auto_var,
+                        style="Toggle.TCheckbutton").pack(side="left", padx=(0, 4))
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y",
+                                                   padx=10, pady=2)
 
-        ttk.Button(bar, text="刷新 (F5)", command=self.start_refresh).pack(side="left", padx=4)
+        # 操作组
+        self.refresh_btn = ttk.Button(bar, text="刷新 (F5)", style="Accent.TButton",
+                                      command=self.start_refresh)
+        self.refresh_btn.pack(side="left", padx=(0, 4))
+        self.kill_btn = ttk.Button(bar, text="结束进程", style="Danger.TButton",
+                                   command=self.kill_selected, state="disabled")
+        self.kill_btn.pack(side="left", padx=(0, 4))
+        self.open_btn = ttk.Button(bar, text="打开目录", command=self.open_dir,
+                                   state="disabled")
+        self.open_btn.pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="导出 CSV", command=self.export_csv).pack(side="left")
 
-        self.kill_btn = ttk.Button(bar, text="结束进程", command=self.kill_selected)
-        self.kill_btn.pack(side="left", padx=4)
-        ttk.Button(bar, text="打开目录", command=self.open_dir).pack(side="left", padx=4)
-        ttk.Button(bar, text="导出 CSV", command=self.export_csv).pack(side="left", padx=4)
-
-        ttk.Label(bar, text="提示: 双击复制地址 · Ctrl+D 可视化 · 右键更多操作",
-                  style="Muted.TLabel").pack(side="right")
+        ttk.Label(bar, text="右键行查看更多操作", style="Muted.TLabel").pack(side="right")
 
     def _build_table(self, parent):
-        wrap = ttk.Frame(parent, padding=(10, 0, 10, 0))
+        wrap = ttk.Frame(parent, padding=(12, 4, 12, 4))
         wrap.pack(fill="both", expand=True)
 
         self.tree = ttk.Treeview(wrap, columns=COLUMNS, show="headings",
@@ -362,11 +517,15 @@ class PortMonitorApp:
         for tag, color in (("listen", "#4ade80"), ("established", "#60a5fa"),
                            ("timewait", "#94a3b8"), ("closewait", "#fbbf24"),
                            ("syn", "#fb923c"), ("udp", "#c084fc"),
-                           ("other", "#f87171"), ("empty", "#64748b")):
+                           ("other", "#f87171")):
             self.tree.tag_configure(tag, foreground=color)
+        self.tree.tag_configure("even", background=BG2)
+        self.tree.tag_configure("odd", background=BG_ODD)
+        self.tree.tag_configure("empty", foreground="#5d6f8c")
 
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
     # ---------- 可视化仪表盘 (纯 Canvas 自绘, 无第三方绘图库) ----------
 
@@ -385,21 +544,26 @@ class PortMonitorApp:
                            lambda e: self._draw_dashboard())
 
     def _build_dashboard(self, parent):
-        cards = ttk.Frame(parent, padding=(10, 8, 10, 2))
-        cards.pack(fill="x")
+        cards = tk.Frame(parent, bg=BG)
+        cards.pack(fill="x", padx=12, pady=(10, 2))
         self._card_vars = {}
-        for key, label in (("conn", "连接总数"), ("listen", "监听端口"),
-                           ("ports", "占用端口"), ("src", "数据来源")):
-            box = ttk.Frame(cards, padding=(10, 6))
-            box.pack(side="left", padx=(0, 10), fill="x", expand=True)
-            ttk.Label(box, text=label, style="Muted.TLabel").pack(anchor="w")
+        specs = (("conn", "连接总数", ACCENT), ("listen", "监听端口", GREEN),
+                 ("ports", "占用端口", ACCENT2), ("src", "数据来源", "#fbbf24"))
+        for key, label, color in specs:
+            card = tk.Frame(cards, bg=CARD, highlightthickness=1,
+                            highlightbackground=BORDER)
+            card.pack(side="left", padx=(0, 10), fill="x", expand=True)
+            tk.Frame(card, bg=color, width=4).pack(side="left", fill="y")
+            inner = tk.Frame(card, bg=CARD)
+            inner.pack(side="left", fill="both", expand=True, padx=12, pady=8)
+            tk.Label(inner, text=label, bg=CARD, fg=MUTED,
+                     font=("Microsoft YaHei UI", 9)).pack(anchor="w")
             var = tk.StringVar(value="—")
-            ttk.Label(box, textvariable=var,
-                      font=("Microsoft YaHei UI", 15, "bold"),
-                      foreground=ACCENT).pack(anchor="w")
+            tk.Label(inner, textvariable=var, bg=CARD, fg=color,
+                     font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
             self._card_vars[key] = var
 
-        grid = ttk.Frame(parent, padding=(10, 2, 10, 10))
+        grid = ttk.Frame(parent, padding=(8, 2, 8, 8))
         grid.pack(fill="both", expand=True)
         for c in range(2):
             grid.columnconfigure(c, weight=1, uniform="dash")
@@ -412,9 +576,9 @@ class PortMonitorApp:
 
     def _chart_panel(self, parent, r, c, title):
         box = ttk.Frame(parent, padding=(0, 4))
-        box.grid(row=r, column=c, sticky="nsew", padx=4, pady=4)
-        ttk.Label(box, text=title, style="Muted.TLabel").pack(anchor="w")
-        cv = tk.Canvas(box, bg=BG2, highlightthickness=0, bd=0)
+        box.grid(row=r, column=c, sticky="nsew", padx=5, pady=5)
+        ttk.Label(box, text=title, style="ChartTitle.TLabel").pack(anchor="w")
+        cv = tk.Canvas(box, bg=CARD, highlightthickness=0, bd=0)
         cv.pack(fill="both", expand=True)
         cv.bind("<Configure>", lambda e: self._schedule_dashboard_draw())
         return cv
@@ -466,30 +630,32 @@ class PortMonitorApp:
         if total == 0:
             self._center_text(cv, "暂无数据")
             return
-        r = min(w * 0.28, h * 0.40)
+        r = min(w * 0.26, h * 0.38)
         cx, cy = w * 0.24, h * 0.52
+        cv.create_oval(cx - r - 5, cy - r - 5, cx + r + 5, cy + r + 5,
+                       outline="#24344f", width=1.5)
         start = 90.0
         for _, value, color in items:
             extent = -360.0 * value / total
             cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=start,
                           extent=extent, style=tk.PIESLICE, fill=color,
-                          outline=BG2, width=2)
+                          outline=CARD, width=2)
             start += extent
-        hr = r * 0.62
-        cv.create_oval(cx - hr, cy - hr, cx + hr, cy + hr, fill=BG2, outline=BG2)
-        cv.create_text(cx, cy - 6, text=str(total), fill=FG,
-                       font=("Microsoft YaHei UI", 14, "bold"))
+        hr = r * 0.60
+        cv.create_oval(cx - hr, cy - hr, cx + hr, cy + hr, fill=CARD, outline=CARD)
+        cv.create_text(cx, cy - 8, text=str(total), fill=FG,
+                       font=("Microsoft YaHei UI", 16, "bold"))
         cv.create_text(cx, cy + 14, text="连接总数", fill=MUTED,
-                       font=("Microsoft YaHei UI", 8))
+                       font=("Microsoft YaHei UI", 9))
         # 图例
-        lx, ly = w * 0.54, h * 0.14
-        step = min(20, (h - 30) / max(len(items), 1))
+        lx, ly = w * 0.52, h * 0.12
+        step = min(22, (h - 40) / max(len(items), 1))
         for i, (label, value, color) in enumerate(items):
             yy = ly + i * step
-            cv.create_rectangle(lx, yy, lx + 12, yy + 12, fill=color, outline="")
-            cv.create_text(lx + 20, yy + 6, anchor="w", fill=FG,
+            self._round_rect(cv, lx, yy, lx + 11, yy + 11, 3, fill=color, outline="")
+            cv.create_text(lx + 19, yy + 6, anchor="w", fill=FG,
                            text="%s %d (%.0f%%)" % (label, value,
-                                                    100.0 * value / total),
+                                                     100.0 * value / total),
                            font=("Microsoft YaHei UI", 9))
 
     def _draw_top_bars(self, cv, rows, key):
@@ -505,18 +671,27 @@ class PortMonitorApp:
             self._center_text(cv, "暂无数据")
             return
         maxv = max(v for _, v in items) or 1
-        pad_l, pad_r, pad_t, pad_b = 10, 34, 12, 8
+        pad_l, pad_r, pad_t, pad_b = 10, 36, 12, 10
         name_w = min(w * 0.34, 150)
         n = len(items)
-        bh = max(6, min(20, (h - pad_t - pad_b) / n - 4))
-        gap = max(2.0, bh * 0.35)
+        bh = max(8, min(20, (h - pad_t - pad_b) / n - 5))
+        gap = max(3.0, bh * 0.45)
+        track_x1 = w - pad_r
         for i, (name, value) in enumerate(items):
             y = pad_t + i * (bh + gap)
             bar_x0 = pad_l + name_w
-            bar_w = (w - pad_r - bar_x0) * value / maxv
+            # 轨道
+            self._round_rect(cv, bar_x0, y, track_x1, y + bh, bh / 2,
+                             fill="#1a2842", outline="")
+            # 数据条 (胶囊形)
             color = BAR_COLORS[i % len(BAR_COLORS)]
-            cv.create_rectangle(bar_x0, y, bar_x0 + max(bar_w, 2), y + bh,
-                                fill=color, outline="")
+            bar_w = (track_x1 - bar_x0) * value / maxv
+            if bar_w >= bh * 1.2:
+                self._round_rect(cv, bar_x0, y, bar_x0 + bar_w, y + bh, bh / 2,
+                                 fill=color, outline="")
+            else:
+                cv.create_rectangle(bar_x0, y, bar_x0 + max(bar_w, 3), y + bh,
+                                    fill=color, outline="")
             label = name if len(name) <= 12 else name[:11] + "…"
             cv.create_text(pad_l, y + bh / 2, anchor="w", fill=FG,
                            text=label, font=("Microsoft YaHei UI", 9))
@@ -547,27 +722,49 @@ class PortMonitorApp:
 
         for g in range(4):
             gy = pad_t + plot_h * g / 3
-            cv.create_line(pad_l, gy, w - pad_r, gy, fill=HEAD_BG)
+            cv.create_line(pad_l, gy, w - pad_r, gy, fill="#233352")
             cv.create_text(pad_l - 6, gy, anchor="e", fill=MUTED,
                            text=str(round(vmax - (vmax - vmin) * g / 3)),
                            font=("Microsoft YaHei UI", 8))
         pts = [(X(i), Y(v)) for i, v in enumerate(vals)]
         cv.create_polygon(pts + [(X(len(samples) - 1), pad_t + plot_h),
                                  (pad_l, pad_t + plot_h)],
-                          fill=ACCENT, stipple="gray50", outline="")
+                          fill=ACCENT2, stipple="gray50", outline="")
         cv.create_line(pts, fill=ACCENT, width=2)
         for x, y in pts:
-            cv.create_oval(x - 2, y - 2, x + 2, y + 2, fill=ACCENT, outline="")
+            cv.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5,
+                           fill=ACCENT, outline=CARD, width=1)
         cv.create_text(pad_l, h - 8, anchor="w", text=samples[0][0], fill=MUTED,
                        font=("Microsoft YaHei UI", 8))
         cv.create_text(w - pad_r, h - 8, anchor="e", text=samples[-1][0],
                        fill=MUTED, font=("Microsoft YaHei UI", 8))
 
     def _build_statusbar(self):
-        bar = ttk.Frame(self.root, padding=(10, 6))
+        bar = tk.Frame(self.root, bg=BG)
         bar.pack(fill="x", side="bottom")
+        tk.Frame(bar, bg=BORDER, height=1).pack(fill="x")
+        row = tk.Frame(bar, bg=BG)
+        row.pack(fill="x", padx=12, pady=(7, 8))
+        self.status_dot = tk.Canvas(row, width=10, height=10, bg=BG,
+                                    highlightthickness=0, bd=0)
+        self.status_dot.pack(side="left")
         self.status_var = tk.StringVar(value="正在扫描端口…")
-        ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="left")
+        tk.Label(row, textvariable=self.status_var, bg=BG, fg=MUTED,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(7, 0))
+        tk.Label(row, text="双击复制地址 · Ctrl+D 切换视图 · F5 刷新",
+                 bg=BG, fg="#5d6f8c",
+                 font=("Microsoft YaHei UI", 9)).pack(side="right")
+
+    def _set_status(self, text, kind="ok"):
+        self.status_var.set(text)
+        self._status_kind = kind
+        dot = {"ok": GREEN, "warn": "#fbbf24", "err": "#f87171"}.get(kind, GREEN)
+        try:
+            self.status_dot.delete("all")
+            self.status_dot.create_oval(2, 2, 8, 8, fill=dot, outline="")
+        except tk.TclError:
+            pass
+        self._update_header_status()
 
     # ---------- 刷新流程 (后台线程采集, 避免界面卡顿) ----------
 
@@ -575,7 +772,7 @@ class PortMonitorApp:
         if self._busy:
             return
         self._busy = True
-        self.status_var.set("正在扫描端口…")
+        self._set_status("正在扫描端口…", "warn")
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
@@ -595,6 +792,7 @@ class PortMonitorApp:
             self._busy = False
             rows, source, err = msg[1], msg[2], msg[3]
             if err:
+                self._set_status("扫描失败", "err")
                 messagebox.showerror("扫描失败", "获取端口信息失败:\n%s" % err)
             else:
                 self.source = source
@@ -656,22 +854,31 @@ class PortMonitorApp:
 
         self.tree.delete(*self.tree.get_children())
         if not rows:
-            self.tree.insert("", "end", values=("", "", "—", "", "", "", "未找到符合条件的连接", ""),
-                             tags=("empty",))
+            self.tree.insert("", "end", values=("", "", "—", "", "", "",
+                                                "未找到符合条件的连接", ""),
+                             tags=("even", "empty"))
             return
-        for r in rows:
+        for i, r in enumerate(rows):
+            bg = "even" if i % 2 == 0 else "odd"
             self.tree.insert("", "end", values=(
                 r["proto"], r["local"], r["port"], r["foreign"],
-                r["state"], r["pid"], r["name"], r["path"]), tags=(row_tag(r),))
+                r["state"], r["pid"], r["name"], r["path"]),
+                tags=(bg, row_tag(r)))
+        self._on_select()
+
+    def _on_select(self, event=None):
+        has = bool(self._selected_rows())
+        self.kill_btn.state(["!disabled"] if has else ["disabled"])
+        self.open_btn.state(["!disabled"] if has else ["disabled"])
 
     def _update_status(self, prefix="已刷新"):
         rows = self._visible_rows()
         listening = sum(1 for r in rows if r["state"] == "LISTENING" or r["proto"] == "UDP")
         ports = {r["port"] for r in rows}
         when = time.strftime("%H:%M:%S")
-        self.status_var.set(
-            "%s · 显示 %d 条连接 · 监听端口 %d 个 · 占用端口 %d 个  |  来源: %s · 上次刷新 %s"
-            % (prefix, len(rows), listening, len(ports), self.source, when))
+        self._set_status("%s · 显示 %d 条 · 监听 %d · 占用端口 %d  |  来源: %s · %s"
+                         % (prefix, len(rows), listening, len(ports),
+                            self.source, when), "ok")
 
     # ---------- 交互 ----------
 
