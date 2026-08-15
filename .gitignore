@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 构建产物
+build/
+dist/
+
+# 运行日志
+port_monitor.log
+*.log
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
