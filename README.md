@@ -4,6 +4,14 @@
 
 ![界面功能] 列表展示所有 TCP/UDP 连接：协议、本地地址、端口、外部地址、状态、PID、进程名、可执行文件路径。
 
+## 📥 下载安装
+
+### 方式一：直接下载 exe（推荐，无需 Python 环境）
+
+前往 [Releases 页面](https://github.com/SeanWang114514/PortMonitor/releases/latest) 下载最新版 `PortMonitor.exe`，双击即可运行，无需安装任何依赖。
+
+### 方式二：源码运行
+
 ## 功能特性
 
 - 📊 **可视化仪表盘**：连接状态分布环形图、Top 进程 / Top 端口排行、连接数趋势曲线（纯 Canvas 自绘，零额外依赖）
